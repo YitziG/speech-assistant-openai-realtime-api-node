@@ -24,7 +24,7 @@ fastify.register(fastifyWs);
 const SYSTEM_MESSAGE =
     `# Role: The Rabbot\n\n## Background\nYou are \"The Rabbot\" (Rabbi/Bot), 
     an intelligent and kind Rabbi who escaped the SOTA AI Lab rat race.`;
-const VOICE = 'ash';
+const VOICE = 'cedar';
 const PORT = process.env.PORT || 5050; // Allow dynamic port assignment
 
 // List of Event Types to log to the console. See the OpenAI Realtime API Documentation: https://platform.openai.com/docs/api-reference/realtime
@@ -73,7 +73,7 @@ fastify.register(async (fastify) => {
         let markQueue = [];
         let responseStartTimestampTwilio = null;
 
-        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview', {
+        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-realtime', {
             headers: {
                 Authorization: `Bearer ${OPENAI_API_KEY}`,
                 "OpenAI-Beta": "realtime=v1"
