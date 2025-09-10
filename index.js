@@ -4,6 +4,8 @@ import dotenv from 'dotenv';
 import process from 'node:process';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
+import gumroadPlugin from './src/plugins/gumroad.mjs';
+import { totalSecondsLeft, deductSeconds, ensureEntitlement } from './src/lib/license.mjs';
 import twilio from 'twilio';
 // Stripe import intentionally omitted (optional later) to avoid runtime dep
 
@@ -17,10 +19,11 @@ const {
     RABBOT_SIZZLE_DEFAULT = 'off', // 🔥 default "sizzle" mode (on|off)
     TWILIO_ACCOUNT_SID,
     TWILIO_AUTH_TOKEN,
-    STRIPE_PAYMENT_LINK,
+    GUMROAD_PRODUCT_PERMALINK,
     TWILIO_NUMBER,
     TRIAL_SECONDS = '300',
     PER_CALL_CAP_SECONDS = '600',
+    ADMIN_TOKEN,
 
 } = process.env;
 
@@ -28,6 +31,10 @@ const {
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const TRIAL_S = Number(TRIAL_SECONDS) || 0;
 const PER_CALL_CAP_S = Number(PER_CALL_CAP_SECONDS) || 0;
+const checkoutUrlFor = (userId) =>
+  GUMROAD_PRODUCT_PERMALINK
+    ? `https://yitzi.gumroad.com/l/${GUMROAD_PRODUCT_PERMALINK}?wanted=true&userId=${encodeURIComponent(userId || 'anonymous')}`
+    : null;
 
 
 if (!OPENAI_API_KEY) {
@@ -38,30 +45,24 @@ if (!OPENAI_API_KEY) {
 const PORT = PORT_ENV || 5050;
 
 // Initialize Fastify
-const fastify = Fastify({logger: false});
+const fastify = Fastify({logger: true});
 fastify.register(fastifyFormBody);
-fastify.register(fastifyWs);
-
-// 🚦 Super‑simple seconds store (phone -> {trialLeft, paidLeft})
-const minutesStore = new Map();
-function getUserEntitlement(phone) {
-  if (!minutesStore.has(phone)) {
-    minutesStore.set(phone, { trialLeft: TRIAL_S, paidLeft: 0 });
-  }
-  return minutesStore.get(phone);
-}
-function totalSecondsLeft(e) { return Math.max(0, (e?.trialLeft||0) + (e?.paidLeft||0)); }
-function deductUsage(e, seconds) {
-  let remaining = seconds;
-  if (e.trialLeft > 0) {
-    const useTrial = Math.min(e.trialLeft, remaining);
-    e.trialLeft -= useTrial;
-    remaining -= useTrial;
-  }
-  if (remaining > 0 && e.paidLeft > 0) {
-    e.paidLeft = Math.max(0, e.paidLeft - remaining);
-  }
-}
+// Ensure we acknowledge Twilio's requested WebSocket subprotocol (if any)
+fastify.register(fastifyWs, {
+    options: {
+        handleProtocols: (protocols /*, request */) => {
+            try {
+                if (Array.isArray(protocols) && protocols.length > 0) {
+                    const chosen = protocols[0];
+                    fastify.log.info({ chosen, protocols }, 'WS subprotocol selected');
+                    return chosen; // Echo first offered (Twilio expects one echoed)
+                }
+            } catch {}
+            return false; // No subprotocol
+        },
+    }
+});
+fastify.register(gumroadPlugin);
 
 const SYSTEM_MESSAGE = `
 # Role & Objective
@@ -152,21 +153,38 @@ fastify.get('/', async (_req, reply) => {
     reply.send({message: 'Rabbot Realtime Voice is live.'});
 });
 
+// Simple debug endpoint to check remaining seconds for a user/phone.
+// Protect with ADMIN_TOKEN if provided (header: x-admin-token or query: token)
+fastify.get('/billing/remaining', async (request, reply) => {
+    const token = request.headers['x-admin-token'] || request.query?.token;
+    if (ADMIN_TOKEN && token !== ADMIN_TOKEN) {
+        return reply.code(401).send({ ok:false, error: 'unauthorized' });
+    }
+    const userId = request.query?.userId || request.query?.phone || request.query?.caller || '';
+    if (!userId) return reply.code(400).send({ ok:false, error: 'missing userId|phone|caller' });
+    const ent = ensureEntitlement(userId);
+    const total = Math.max(0, (ent.trialLeft || 0) + (ent.paidLeft || 0));
+    reply.send({ ok:true, userId, trialLeft: ent.trialLeft || 0, paidLeft: ent.paidLeft || 0, totalLeft: total });
+});
+
 // Twilio webhook: connect media stream
 fastify.all('/incoming-call', async (request, reply) => {
     const from = request.body?.From || request.query?.From || '';
-    const ent = getUserEntitlement(from);
-    const secondsLeft = totalSecondsLeft(ent);
+
+    ensureEntitlement(from);
+    const secondsLeft = totalSecondsLeft(from);
+
     console.log(`Incoming call from ${from || 'unknown'} — seconds remaining: ${secondsLeft}s`);
 
     if (secondsLeft <= 0) {
       // Text them the checkout link
-      if (STRIPE_PAYMENT_LINK && TWILIO_NUMBER && from) {
+      const link = checkoutUrlFor(from);
+      if (link && TWILIO_NUMBER && from) {
         try {
           await twilioClient.messages.create({
             to: from,
             from: TWILIO_NUMBER,
-            body: `Your Rabbot trial is used up. Get more minutes: ${STRIPE_PAYMENT_LINK}`
+            body: `Your Rabbot trial is used up. Get more minutes: ${link}`
           });
         } catch (e) { console.error('SMS fail', e?.message || e); }
       }
@@ -182,10 +200,32 @@ fastify.all('/incoming-call', async (request, reply) => {
     // Limit this call by what's left (and an absolute per‑call cap)
     const cap = PER_CALL_CAP_S > 0 ? PER_CALL_CAP_S : secondsLeft;
     const allowThisCall = Math.min(secondsLeft, cap);
+    console.log(`[Call cap] Allowing up to ${allowThisCall}s this call (cap=${cap}s, left=${secondsLeft}s)`);
+
+    // Build WSS URL and escape for XML attribute (avoid Twilio 12100 parse error)
+    const buildWsUrl = () => {
+      const host = request.headers.host;
+      const callerParam = encodeURIComponent(from);
+      const raw = `wss://${host}/media-stream?caller=${callerParam}&max=${allowThisCall}`;
+      // Minimal XML attribute escaping
+      return raw
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;');
+    };
+
+    const esc = (s) => String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
     const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
       <Connect>
-        <Stream url="wss://${request.headers.host}/media-stream?caller=${encodeURIComponent(from)}&max=${allowThisCall}" />
+        <Stream url="${buildWsUrl()}">
+          <Parameter name="caller" value="${esc(from)}" />
+          <Parameter name="max" value="${allowThisCall}" />
+        </Stream>
       </Connect>
     </Response>`;
     reply.type('text/xml').send(twimlResponse);
@@ -197,8 +237,9 @@ fastify.register(async (fastify) => {
         console.log('Client connected');
         // Query params from <Stream url="...">
         const url = new URL(req.url, `http://${req.headers.host}`);
-        const caller = url.searchParams.get('caller') || '';
-        const maxThisCall = Number(url.searchParams.get('max') || '0') || 0;
+        let caller = url.searchParams.get('caller') || '';
+        let maxThisCall = Number(url.searchParams.get('max') || '0') || 0;
+        console.log(`[WS connect] caller=${caller || '(missing)'} max=${maxThisCall}s path=${req.url}`);
 
         // Per-connection state
         let streamSid = null;
@@ -209,6 +250,27 @@ fastify.register(async (fastify) => {
         let callSid = null;
         let callStartedAt = null;
         let cutoffTimer = null;
+        let billed = false; // ensure we only deduct once per connection
+
+        const billUsage = (reason = 'unknown') => {
+            if (billed) return;
+            if (!caller) {
+                console.warn(`[Billing] skip (${reason}): missing caller`);
+                return;
+            }
+            if (!callStartedAt) {
+                console.warn(`[Billing] skip (${reason}): callStartedAt not set`);
+                return;
+            }
+            billed = true;
+            // Prefer wall time since start, but include Twilio timestamp as a lower bound
+            const wall = Math.ceil((Date.now() - callStartedAt) / 1000);
+            const twilioMs = Number.isFinite(latestMediaTimestamp) ? latestMediaTimestamp : 0;
+            const fromTwilio = Math.ceil((twilioMs || 0) / 1000);
+            const seconds = Math.max(1, Math.max(wall, fromTwilio));
+            const ent = deductSeconds(caller, seconds);
+            console.log(`Usage deducted ${seconds}s for ${caller} [${reason}]. TrialLeft=${ent.trialLeft}s PaidLeft=${ent.paidLeft}s`);
+        };
 
         let hasActiveResponse = false;
         let assistantStreaming = false;
@@ -505,10 +567,19 @@ fastify.register(async (fastify) => {
                 case 'start': {
                     streamSid = data.start.streamSid;
                     callSid = data.start.callSid;
+                    // Optional: recover caller/max from customParameters if query params were dropped by provider
+                    try {
+                        const cp = data?.start?.customParameters || data?.start?.custom_parameters;
+                        if (cp) {
+                            if (!caller && (cp.caller || cp.CALLER)) caller = String(cp.caller || cp.CALLER || '');
+                            if (!maxThisCall && (cp.max || cp.MAX)) maxThisCall = Number(cp.max || cp.MAX) || maxThisCall;
+                        }
+                    } catch {}
                     console.log('Twilio stream started', streamSid);
                     responseStartTimestampTwilio = null;
                     latestMediaTimestamp = 0;
                     callStartedAt = Date.now();
+                    console.log(`[Billing] start caller=${caller} callSid=${callSid || '(n/a)'} startedAt=${new Date(callStartedAt).toISOString()} max=${maxThisCall}s`);
 
                     // ⛔ auto-hangup when they hit their allowance for this call
                     if (maxThisCall > 0 && twilioClient && callSid) {
@@ -524,10 +595,11 @@ fastify.register(async (fastify) => {
                                       </Response>`
                                   });
                                 // SMS link
-                                if (STRIPE_PAYMENT_LINK && TWILIO_NUMBER && caller) {
+                                const link = checkoutUrlFor(caller);
+                                if (link && TWILIO_NUMBER && caller) {
                                   await twilioClient.messages.create({
                                     to: caller, from: TWILIO_NUMBER,
-                                    body: `Add minutes to Rabbot: ${STRIPE_PAYMENT_LINK}`
+                                    body: `Add minutes to Rabbot: ${link}`
                                   });
                                 }
                             } catch (err) {
@@ -585,13 +657,8 @@ fastify.register(async (fastify) => {
                     }
                     console.log('Twilio stream stopped');
                     if (cutoffTimer) { clearTimeout(cutoffTimer); cutoffTimer = null; }
-                    // bill actual usage
-                    if (caller && callStartedAt) {
-                      const seconds = Math.max(1, Math.ceil((Date.now() - callStartedAt) / 1000));
-                      const ent = getUserEntitlement(caller);
-                      deductUsage(ent, seconds);
-                      console.log(`Usage deducted ${seconds}s for ${caller}. TrialLeft=${ent.trialLeft}s PaidLeft=${ent.paidLeft}s`);
-                    }
+                    // bill actual usage once
+                    billUsage('stop');
                     break;
                 }
                 default:
@@ -603,12 +670,8 @@ fastify.register(async (fastify) => {
 
         connection.on('close', () => {
             if (cutoffTimer) { clearTimeout(cutoffTimer); cutoffTimer = null; }
-            if (caller && callStartedAt) {
-              const seconds = Math.max(1, Math.ceil((Date.now() - callStartedAt) / 1000));
-              const ent = getUserEntitlement(caller);
-              deductUsage(ent, seconds);
-              console.log(`Usage deducted (close) ${seconds}s for ${caller}. TrialLeft=${ent.trialLeft}s PaidLeft=${ent.paidLeft}s`);
-            }
+            // bill if not already billed
+            billUsage('close');
             try {
                 if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
             } catch {
