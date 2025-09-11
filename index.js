@@ -5,7 +5,9 @@ import process from 'node:process';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
 import gumroadPlugin from './src/plugins/gumroad.mjs';
-import { totalSecondsLeft, deductSeconds, ensureEntitlement } from './src/lib/license.mjs';
+import { initDb } from './src/lib/db.mjs';
+import { findOrCreateByPhone } from './src/lib/contacts.mjs';
+import { totalSecondsLeft, deductSeconds, ensureEntitlement, upgradeEntitlementFromContact } from './src/lib/license.mjs';
 import twilio from 'twilio';
 // Stripe import intentionally omitted (optional later) to avoid runtime dep
 
@@ -63,6 +65,15 @@ fastify.register(fastifyWs, {
     }
 });
 fastify.register(gumroadPlugin);
+
+// Initialize DB (if DB_URI is provided)
+(async () => {
+  try {
+    await initDb();
+  } catch (e) {
+    console.warn('[DB] Skipping DB init:', e?.message || e);
+  }
+})();
 
 const SYSTEM_MESSAGE = `
 # Role & Objective
@@ -153,6 +164,19 @@ fastify.get('/', async (_req, reply) => {
     reply.send({message: 'Rabbot Realtime Voice is live.'});
 });
 
+// Optional: quick check to verify DB connectivity without altering schema
+fastify.get('/db/health', async (_req, reply) => {
+  try {
+    // Lazy import to keep this endpoint decoupled if DB is not configured
+    const { sequelize } = await import('./src/lib/db.mjs');
+    if (!sequelize) return reply.send({ ok:false, connected:false, reason:'no DB configured' });
+    await sequelize.authenticate();
+    return reply.send({ ok:true, connected:true });
+  } catch (e) {
+    return reply.send({ ok:false, connected:false, error: e?.message || String(e) });
+  }
+});
+
 // Simple debug endpoint to check remaining seconds for a user/phone.
 // Protect with ADMIN_TOKEN if provided (header: x-admin-token or query: token)
 fastify.get('/billing/remaining', async (request, reply) => {
@@ -170,6 +194,24 @@ fastify.get('/billing/remaining', async (request, reply) => {
 // Twilio webhook: connect media stream
 fastify.all('/incoming-call', async (request, reply) => {
     const from = request.body?.From || request.query?.From || '';
+    console.log('[Call] Incoming', { from });
+
+    // Lookup or create shared Contact by phone number and upgrade entitlements
+    let contactWid = '';
+    let isUnlimited = false;
+    try {
+      const res = await findOrCreateByPhone(from);
+      if (res?.contact) {
+        contactWid = res.contact.wid || '';
+        const ent = upgradeEntitlementFromContact(from, res.contact);
+        isUnlimited = !!res.contact.is_unlimited;
+        console.log('[Call] Contact mapped', { from, wid: contactWid, created: !!res.created, unlimited: isUnlimited, paidLeft: ent.paidLeft, trialLeft: ent.trialLeft });
+      } else {
+        console.warn('[Call] Contact not available', { reason: res?.reason || 'unknown' });
+      }
+    } catch (e) {
+      console.warn('[Call] Contact lookup failed', e?.message || e);
+    }
 
     ensureEntitlement(from);
     const secondsLeft = totalSecondsLeft(from);
@@ -206,7 +248,9 @@ fastify.all('/incoming-call', async (request, reply) => {
     const buildWsUrl = () => {
       const host = request.headers.host;
       const callerParam = encodeURIComponent(from);
-      const raw = `wss://${host}/media-stream?caller=${callerParam}&max=${allowThisCall}`;
+      const widParam = contactWid ? `&wid=${encodeURIComponent(contactWid)}` : '';
+      const ulParam = isUnlimited ? `&unlimited=1` : '';
+      const raw = `wss://${host}/media-stream?caller=${callerParam}&max=${allowThisCall}${widParam}${ulParam}`;
       // Minimal XML attribute escaping
       return raw
         .replace(/&/g, '&amp;')
@@ -224,6 +268,8 @@ fastify.all('/incoming-call', async (request, reply) => {
       <Connect>
         <Stream url="${buildWsUrl()}">
           <Parameter name="caller" value="${esc(from)}" />
+          ${contactWid ? `<Parameter name="wid" value="${esc(contactWid)}" />` : ''}
+          ${isUnlimited ? `<Parameter name="unlimited" value="1" />` : ''}
           <Parameter name="max" value="${allowThisCall}" />
         </Stream>
       </Connect>
@@ -239,7 +285,9 @@ fastify.register(async (fastify) => {
         const url = new URL(req.url, `http://${req.headers.host}`);
         let caller = url.searchParams.get('caller') || '';
         let maxThisCall = Number(url.searchParams.get('max') || '0') || 0;
-        console.log(`[WS connect] caller=${caller || '(missing)'} max=${maxThisCall}s path=${req.url}`);
+        let contactWid = url.searchParams.get('wid') || '';
+        let isUnlimited = ['1','true','yes'].includes(String(url.searchParams.get('unlimited') || '').toLowerCase());
+        console.log(`[WS connect] caller=${caller || '(missing)'} wid=${contactWid || '(none)'} unlimited=${isUnlimited} max=${maxThisCall}s path=${req.url}`);
 
         // Per-connection state
         let streamSid = null;
@@ -268,6 +316,10 @@ fastify.register(async (fastify) => {
             const twilioMs = Number.isFinite(latestMediaTimestamp) ? latestMediaTimestamp : 0;
             const fromTwilio = Math.ceil((twilioMs || 0) / 1000);
             const seconds = Math.max(1, Math.max(wall, fromTwilio));
+            if (isUnlimited) {
+                console.log(`[Billing] skip deduction (${reason}): unlimited user ${caller} (${seconds}s)`);
+                return;
+            }
             const ent = deductSeconds(caller, seconds);
             console.log(`Usage deducted ${seconds}s for ${caller} [${reason}]. TrialLeft=${ent.trialLeft}s PaidLeft=${ent.paidLeft}s`);
         };
@@ -567,12 +619,28 @@ fastify.register(async (fastify) => {
                 case 'start': {
                     streamSid = data.start.streamSid;
                     callSid = data.start.callSid;
-                    // Optional: recover caller/max from customParameters if query params were dropped by provider
+                    // Recover params from Twilio customParameters if query params were dropped by provider
                     try {
-                        const cp = data?.start?.customParameters || data?.start?.custom_parameters;
+                        const cp = data?.start?.customParameters || data?.start?.custom_parameters || {};
                         if (cp) {
-                            if (!caller && (cp.caller || cp.CALLER)) caller = String(cp.caller || cp.CALLER || '');
-                            if (!maxThisCall && (cp.max || cp.MAX)) maxThisCall = Number(cp.max || cp.MAX) || maxThisCall;
+                            // Caller ID
+                            const fromCp = cp.caller || cp.From || cp.from || cp.CALLER;
+                            if (!caller && fromCp) caller = String(fromCp);
+                            // Max seconds for this call
+                            const maxCp = cp.max || cp.Max || cp.MAX;
+                            if (!maxThisCall && maxCp) {
+                                const n = Number(maxCp);
+                                if (Number.isFinite(n)) maxThisCall = n;
+                            }
+                            // Contact WID
+                            const widCp = cp.wid || cp.WID || cp.Wid;
+                            if (!contactWid && widCp) contactWid = String(widCp);
+                            // Unlimited flag
+                            if (cp.unlimited != null) {
+                              const v = String(cp.unlimited).toLowerCase();
+                              if (['1','true','yes'].includes(v)) isUnlimited = true;
+                            }
+                            console.log('[WS params] Recovered from customParameters', { caller, contactWid, isUnlimited, maxThisCall });
                         }
                     } catch {}
                     console.log('Twilio stream started', streamSid);

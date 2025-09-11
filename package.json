@@ -4,7 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "railway:env": "bash ./scripts/railway-set-env.sh .env",
+    "verify": "node ./scripts/verify.mjs",
+    "verify:railway": "node ./scripts/verify.mjs"
   },
   "keywords": [],
   "author": "",
@@ -15,6 +18,8 @@
     "@fastify/websocket": "^11.0.0",
     "dotenv": "^16.4.5",
     "fastify": "^5.0.0",
+    "pg": "^8.11.3",
+    "sequelize": "^6.37.3",
     "twilio": "^5.9.0",
     "ws": "^8.18.0"
   }

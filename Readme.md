@@ -70,6 +70,35 @@ cp .env.example .env
 
 In the .env file, update the `OPENAI_API_KEY` to your OpenAI API key from the **Prerequisites**.
 
+If deploying on Railway, you can push your local environment values to your Railway service using the CLI:
+
+```
+npm run railway:env
+```
+
+Notes:
+- Ensure `DB_URI` matches the value used by your `aibot` project so both apps share the same Postgres database and `Contacts` table.
+- The script reads key=value pairs from your local `.env` and runs `railway variables set` for each.
+- You must be logged into Railway and targeted at the correct project/service before running the command.
+- If your provider does not support TLS for Postgres, set `DB_SSL=disable`. Default is `require`.
+
+### Verify deployment (local or Railway)
+
+Run the verify script to check that the server responds and the database connection is healthy:
+
+```
+# Local (defaults to http://localhost:5050)
+npm run verify
+
+# Remote (set the base URL)
+VERIFY_BASE_URL=https://your-service.up.railway.app npm run verify
+
+# If your CLI exposes RAILWAY_URL or RAILWAY_PUBLIC_DOMAIN, the script will use it automatically
+npm run verify:railway
+```
+
+The script calls `/` and `/db/health` and exits non‑zero if DB health is not ok.
+
 ## Run the app
 Once ngrok is running, dependencies are installed, Twilio is configured properly, and the `.env` is set up, run the dev server with the following command:
 ```
