@@ -27,7 +27,7 @@ const {
     PER_CALL_CAP_SECONDS = '600',
     ADMIN_TOKEN,
     // Optional VAD tuning
-    VAD_THRESHOLD = '0.7',
+    VAD_THRESHOLD = '0.5',
     VAD_SILENCE_MS = '500',
     VAD_PREFIX_MS = '200',
     // Optional fast barge-in tuning (local heuristic)
@@ -463,6 +463,7 @@ fastify.register(async (fastify) => {
                     audio: {
                         input: {
                             format: {type: 'audio/pcmu'},
+                            noise_reduction: { type: 'near_field' },
                             // Move VAD config back under audio.input to satisfy GA shape
                             turn_detection: (() => {
                                 const mode = String(VAD_MODE || 'server').toLowerCase();
@@ -683,6 +684,7 @@ fastify.register(async (fastify) => {
 
             // Barge-in cues
             if (response.type === 'input_audio_buffer.speech_started') {
+                try { console.log('[BARGE] server VAD speech_started'); } catch {}
                 handleSpeechStartedEvent();
             }
             if (response.type === 'input_audio_buffer.speech_stopped' || response.type === 'input_audio_buffer.committed') {
