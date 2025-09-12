@@ -26,6 +26,16 @@ const {
     TRIAL_SECONDS = '300',
     PER_CALL_CAP_SECONDS = '600',
     ADMIN_TOKEN,
+    // Optional VAD tuning
+    VAD_THRESHOLD = '0.7',
+    VAD_SILENCE_MS = '500',
+    VAD_PREFIX_MS = '200',
+    // Optional fast barge-in tuning (local heuristic)
+    FAST_BARGE = 'on',
+    FAST_BARGE_MIN_NON_SILENT = '44',
+    FAST_BARGE_WINDOW_BYTES = '160',
+    FAST_BARGE_COOLDOWN_MS = '250',
+    FAST_BARGE_FRAMES = '3',
 
 } = process.env;
 
@@ -154,7 +164,9 @@ const TEMPERATURE = Number('0.8');
 
 // Event logging
 const LOG_EVENT_TYPES = ['error', 'response.content.done', 'rate_limits.updated',
-    'response.created', 'response.done', 'input_audio_buffer.committed', 'input_audio_buffer.speech_stopped', 'input_audio_buffer.speech_started', 'session.created', 'session.updated', 'response.audio.delta'];// Latency math toggle
+    'response.created', 'response.done', 'input_audio_buffer.committed', 'input_audio_buffer.speech_stopped', 'input_audio_buffer.speech_started', 'session.created', 'session.updated',
+    // GA event names
+    'response.output_audio.delta', 'response.output_text.delta', 'response.output_audio_transcript.delta'];// Latency math toggle
 const SHOW_TIMING_MATH = false;
 
 const ENABLE_TEXT_TAPS = true; // set true to log assistant text
@@ -342,6 +354,14 @@ fastify.register(async (fastify) => {
 
         let hasActiveResponse = false;
         let assistantStreaming = false;
+        // GA barge-in and gating state
+        let currentResponseId = null;
+        let dropAudioUntilNextResponse = false;
+        let userSpeaking = false; // true between speech_started and speech_stopped/committed
+        let lastLocalBargeTs = 0;
+        let fastBargeCount = 0;
+        // Track how many assistant audio bytes we've actually forwarded to Twilio for the current response
+        let assistantBytesSent = 0;
 
         // 🔥 Low-latency auto-commit (server-VAD style)
         let hasUncommittedAudio = false;
@@ -374,16 +394,41 @@ fastify.register(async (fastify) => {
         };
 
         const handleSpeechStartedEvent = () => {
-
-            if (streamSid) {
-                connection.send(JSON.stringify({event: 'clear', streamSid}));
+            // True barge-in: prefer server-side interrupt via turn_detection, but also try to cancel if mid-stream
+            const shouldCancel = hasActiveResponse || assistantStreaming || !!currentResponseId;
+            if (shouldCancel) {
+                try {
+                    if (currentResponseId) {
+                        send({ type: 'response.cancel', response_id: currentResponseId });
+                    } else {
+                        send({ type: 'response.cancel' });
+                    }
+                } catch {}
             }
-
+            // Regardless, drop any late deltas until next response begins
+            dropAudioUntilNextResponse = true;
+            userSpeaking = true;
+            // Attempt to trim the assistant's last output item so transcripts match what was heard
+            try {
+                if (lastAssistantItem && assistantBytesSent > 0) {
+                    const audio_end_ms = Math.floor(assistantBytesSent / 8); // 8000 bytes ≈ 1000ms
+                    // Lightweight log: server-side truncate to align transcript with heard audio
+                    try { console.log(`[TRUNCATE] item=${lastAssistantItem} audio_end_ms=${audio_end_ms}`); } catch {}
+                    send({
+                        type: 'conversation.item.truncate',
+                        item_id: lastAssistantItem,
+                        content_index: 0,
+                        audio_end_ms
+                    });
+                }
+            } catch {}
+            // Reset local tracking
             markQueue = [];
             lastAssistantItem = null;
             responseStartTimestampTwilio = null;
             assistantStreaming = false;
             hasActiveResponse = false;
+            fastBargeCount = 0;
         };
 
 
@@ -407,21 +452,34 @@ fastify.register(async (fastify) => {
                 type: 'session.update', session: {
                     type: 'realtime',
                     model: 'gpt-realtime',
-                    // If enabled, also request text alongside audio so we can log highlights
+                    // Output modality: 'audio' only (model in this env does not allow both)
                     output_modalities: ['audio'],
 
                     // ✅ GA schema: nested audio.{input,output}.format.type = 'audio/pcmu'
                     audio: {
                         input: {
-                            format: {type: 'audio/pcmu'}, // optional server VAD here (safe to keep):
-                            turn_detection: {type: 'server_vad'}
-                        }, output: {
+                            format: {type: 'audio/pcmu'},
+                            // Move VAD config back under audio.input to satisfy GA shape
+                            turn_detection: {
+                                type: 'server_vad',
+                                threshold: Math.max(0, Math.min(1, Number(VAD_THRESHOLD) || 0.5)),
+                                silence_duration_ms: Number(VAD_SILENCE_MS) || 500,
+                                prefix_padding_ms: Number(VAD_PREFIX_MS) || 200,
+                                // Auto behaviors to reduce audible tail
+                                interrupt_response: true,
+                                create_response: true,
+                            }
+                        },
+                        output: {
                             format: {type: 'audio/pcmu'}, voice: VOICE
                         },
                     },
 
                     // system instructions
                     instructions: SYSTEM_MESSAGE,
+
+                    // Note: input_audio_transcription is only supported in transcription-only sessions.
+                    // For conversation (speech-to-speech) mode, omit it to avoid unknown_parameter errors.
 
                     // your simple, side-effect-free tools
                     tools: [{
@@ -525,13 +583,18 @@ fastify.register(async (fastify) => {
             }
 
             if (response.type === 'error') {
-                // ⭐ Print the full error for debugging
-                console.error('Realtime ERROR:', {
-                    message: response.error?.message,
-                    type: response.error?.type,
-                    code: response.error?.code,
-                    details: response.error,
-                });
+                const code = response.error?.code;
+                // Ignore benign race from barge-in when generation already finished
+                if (code === 'response_cancel_not_active') {
+                    if (fastify.log?.debug) fastify.log.debug('Cancel ignored: no active response');
+                } else {
+                    console.error('Realtime ERROR:', {
+                        message: response.error?.message,
+                        type: response.error?.type,
+                        code: code,
+                        details: response.error,
+                    });
+                }
             }
 
 
@@ -541,14 +604,26 @@ fastify.register(async (fastify) => {
 
             if (response.type === 'response.created') {
                 hasActiveResponse = true;
+                // Track current response for barge-in dropping
+                currentResponseId = response.response?.id || response.id || null;
+                dropAudioUntilNextResponse = false;
+                assistantBytesSent = 0;
             }
 
-            // Audio deltas → Twilio
+            // Audio deltas → Twilio (GA name; keep legacy as fallback)
             if ((response.type === 'response.output_audio.delta' || response.type === 'response.audio.delta') && response.delta) {
+                // Gate: drop if we've canceled this response, or user is speaking
+                if (dropAudioUntilNextResponse || userSpeaking) {
+                    // swallow this delta to prevent double-talk / late tails
+                } else {
                 const audioDelta = {
                     event: 'media', streamSid, media: {payload: response.delta},
                 };
                 connection.send(JSON.stringify(audioDelta));
+                try {
+                    // Count bytes forwarded (PCMU 8kHz: 8000 bytes ≈ 1000ms)
+                    assistantBytesSent += Buffer.from(response.delta, 'base64').length;
+                } catch {}
 
                 if (!responseStartTimestampTwilio) {
                     responseStartTimestampTwilio = latestMediaTimestamp;
@@ -559,21 +634,40 @@ fastify.register(async (fastify) => {
 
                 // mark to detect "assistant finished" via Twilio mark callback
                 sendMark();
+                }
             }
 
-            if (ENABLE_TEXT_TAPS && response.type === 'response.text.delta') {
+            // Text deltas (GA)
+            if (ENABLE_TEXT_TAPS && (response.type === 'response.output_text.delta' || response.type === 'response.text.delta')) {
                 // keep lines short—these arrive as small chunks
-                console.log('ASSISTANT_TEXT:', response.text);
+                const textDelta = typeof response.delta === 'string' ? response.delta : (response.text || '');
+                if (textDelta) console.log('ASSISTANT_TEXT:', textDelta);
+            }
+
+            // Optional: audio transcript deltas (GA)
+            if (response.type === 'response.output_audio_transcript.delta') {
+                if (response.delta) console.log('ASSISTANT_ASR:', response.delta);
             }
 
             if (response.type === 'response.done') {
                 hasActiveResponse = false;
                 assistantStreaming = false;
+                currentResponseId = null;
+                dropAudioUntilNextResponse = false;
+                assistantBytesSent = 0;
             }
 
-            // Barge-in cue
+            // Capture the assistant output item id as soon as it's added
+            if (response.type === 'response.output_item.added' && response.item?.id) {
+                lastAssistantItem = response.item.id;
+            }
+
+            // Barge-in cues
             if (response.type === 'input_audio_buffer.speech_started') {
                 handleSpeechStartedEvent();
+            }
+            if (response.type === 'input_audio_buffer.speech_stopped' || response.type === 'input_audio_buffer.committed') {
+                userSpeaking = false;
             }
 
             // 🔥 Handle simple tool calls (shape 1: function-event)
@@ -715,6 +809,36 @@ fastify.register(async (fastify) => {
                 }
                 case 'media': {
                     latestMediaTimestamp = data.media.timestamp;
+                    // Optional: fast local barge-in (disabled by default; enable via FAST_BARGE=on)
+                    try {
+                        const FAST_BARGE_ON = String(FAST_BARGE || '').toLowerCase() === 'on';
+                        if (FAST_BARGE_ON && assistantStreaming && !userSpeaking && !dropAudioUntilNextResponse) {
+                            const since = now() - lastLocalBargeTs;
+                            if (since > (Number(FAST_BARGE_COOLDOWN_MS) || 250)) {
+                                const b64 = data.media.payload;
+                                const buf = Buffer.from(b64, 'base64');
+                                let nonSilent = 0;
+                                const win = Math.max(1, Number(FAST_BARGE_WINDOW_BYTES) || 160);
+                                const len = Math.min(buf.length, win);
+                                for (let i = 0; i < len; i++) {
+                                    const v = buf[i];
+                                    if (v !== 0xFF && v !== 0x7F && v !== 0x00 && v !== 0x80) nonSilent++;
+                                }
+                                if (nonSilent > (Number(FAST_BARGE_MIN_NON_SILENT) || 28)) {
+                                    fastBargeCount += 1;
+                                    if (fastBargeCount >= (Number(FAST_BARGE_FRAMES) || 2)) {
+                                        // Lightweight log: local heuristic barge triggered
+                                        try { console.log(`[BARGE] local trigger nonSilent=${nonSilent} len=${len} frames=${fastBargeCount}`); } catch {}
+                                        lastLocalBargeTs = now();
+                                        handleSpeechStartedEvent();
+                                        fastBargeCount = 0;
+                                    }
+                                } else {
+                                    fastBargeCount = 0;
+                                }
+                            }
+                        }
+                    } catch {}
                     // forward audio to OpenAI
                     if (openAiWs.readyState === WebSocket.OPEN) {
                         send({
