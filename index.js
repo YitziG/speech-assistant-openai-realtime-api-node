@@ -31,11 +31,15 @@ const {
     VAD_SILENCE_MS = '500',
     VAD_PREFIX_MS = '200',
     // Optional fast barge-in tuning (local heuristic)
-    FAST_BARGE = 'on',
+    FAST_BARGE = 'off',
     FAST_BARGE_MIN_NON_SILENT = '44',
     FAST_BARGE_WINDOW_BYTES = '160',
     FAST_BARGE_COOLDOWN_MS = '250',
     FAST_BARGE_FRAMES = '3',
+    FAST_BARGE_START_GUARD_MS = '1200',
+    // VAD mode: 'server' (default) or 'semantic'
+    VAD_MODE = 'server',
+    VAD_SEMANTIC_EAGERNESS = 'auto',
 
 } = process.env;
 
@@ -460,15 +464,30 @@ fastify.register(async (fastify) => {
                         input: {
                             format: {type: 'audio/pcmu'},
                             // Move VAD config back under audio.input to satisfy GA shape
-                            turn_detection: {
-                                type: 'server_vad',
-                                threshold: Math.max(0, Math.min(1, Number(VAD_THRESHOLD) || 0.5)),
-                                silence_duration_ms: Number(VAD_SILENCE_MS) || 500,
-                                prefix_padding_ms: Number(VAD_PREFIX_MS) || 200,
-                                // Auto behaviors to reduce audible tail
-                                interrupt_response: true,
-                                create_response: true,
-                            }
+                            turn_detection: (() => {
+                                const mode = String(VAD_MODE || 'server').toLowerCase();
+                                if (mode === 'semantic') {
+                                    // semantic_vad uses eagerness instead of threshold/silence
+                                    const eagerness = ['low','medium','high','auto'].includes(String(VAD_SEMANTIC_EAGERNESS).toLowerCase())
+                                        ? String(VAD_SEMANTIC_EAGERNESS).toLowerCase()
+                                        : 'auto';
+                                    return {
+                                        type: 'semantic_vad',
+                                        eagerness,
+                                        interrupt_response: true,
+                                        create_response: true,
+                                    };
+                                }
+                                // default: server_vad
+                                return {
+                                    type: 'server_vad',
+                                    threshold: Math.max(0, Math.min(1, Number(VAD_THRESHOLD) || 0.5)),
+                                    silence_duration_ms: Number(VAD_SILENCE_MS) || 500,
+                                    prefix_padding_ms: Number(VAD_PREFIX_MS) || 200,
+                                    interrupt_response: true,
+                                    create_response: true,
+                                };
+                            })()
                         },
                         output: {
                             format: {type: 'audio/pcmu'}, voice: VOICE
@@ -814,7 +833,12 @@ fastify.register(async (fastify) => {
                         const FAST_BARGE_ON = String(FAST_BARGE || '').toLowerCase() === 'on';
                         if (FAST_BARGE_ON && assistantStreaming && !userSpeaking && !dropAudioUntilNextResponse) {
                             const since = now() - lastLocalBargeTs;
-                            if (since > (Number(FAST_BARGE_COOLDOWN_MS) || 250)) {
+                            const guardMs = Number(FAST_BARGE_START_GUARD_MS) || 1200;
+                            // Skip local barge while within the echo guard window from assistant start
+                            const sinceStart = (responseStartTimestampTwilio && latestMediaTimestamp)
+                                ? (latestMediaTimestamp - responseStartTimestampTwilio)
+                                : Infinity; // allow if not measurable
+                            if (since > (Number(FAST_BARGE_COOLDOWN_MS) || 250) && sinceStart > guardMs) {
                                 const b64 = data.media.payload;
                                 const buf = Buffer.from(b64, 'base64');
                                 let nonSilent = 0;
