@@ -354,7 +354,7 @@ fastify.register(async (fastify) => {
         let sizzleMode = (RABBOT_SIZZLE_DEFAULT.toLowerCase() === 'on');
 
         const openAiWs = new WebSocket(// NOTE: voice in query helps some stacks; we also set it in session.update
-            `wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${TEMPERATURE}&voice=${VOICE}`, {
+            `wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${TEMPERATURE}`, {
                 headers: {
                     Authorization: `Bearer ${OPENAI_API_KEY}`,
                 },
@@ -416,8 +416,8 @@ fastify.register(async (fastify) => {
                             format: {type: 'audio/pcmu'}, // optional server VAD here (safe to keep):
                             turn_detection: {type: 'server_vad'}
                         }, output: {
-                            format: {type: 'audio/pcmu'}
-                        }
+                            format: {type: 'audio/pcmu'}, voice: VOICE
+                        },
                     },
 
                     // system instructions
