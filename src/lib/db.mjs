@@ -4,6 +4,7 @@ dotenv.config();
 
 let sequelize = null;
 let Contact = null;
+let UserActivity = null;
 
 function pickDbUri() {
   const candidates = [
@@ -113,10 +114,26 @@ async function initDb() {
     { tableName: 'Contacts', timestamps: true }
   );
 
+  // Minimal UserActivity model for logging usage; matches aibot schema
+  UserActivity = sequelize.define(
+    'UserActivity',
+    {
+      id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+      contactId: { type: DataTypes.STRING, allowNull: false },
+      timestamp: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+      action_type: { type: DataTypes.STRING, allowNull: false },
+      action_outcome: { type: DataTypes.STRING, allowNull: false },
+      rbt_change: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+      user_level: { type: DataTypes.INTEGER, allowNull: true },
+      contextual_info: { type: DataTypes.JSONB, allowNull: true }
+    },
+    { tableName: 'UserActivities', underscored: true }
+  );
+
   // Do NOT sync/alter — we share the existing table managed by `aibot` migrations
   await sequelize.authenticate();
   console.log('[DB] Connected. Contacts table is now shared with aibot. DSN:', redactUri(normalized));
   return { ok: true };
 }
 
-export { sequelize, Contact, initDb };
+export { sequelize, Contact, UserActivity, initDb };

@@ -18,8 +18,8 @@ export default async function gumroadPlugin(fastify) {
     const license  = body.license_key;
     const qty      = Number(body.quantity || 1);
 
-    grantPro(userId, license);
-    addPaidSeconds(userId, TOPUP_S * Math.max(1, qty));
+    await grantPro(userId, license);
+    await addPaidSeconds(userId, TOPUP_S * Math.max(1, qty));
 
     return reply.code(200).send('OK');
   });
@@ -38,8 +38,8 @@ export default async function gumroadPlugin(fastify) {
       });
       const json = await res.json();
       if (json.success) {
-        grantPro(userId, license_key);
-        addPaidSeconds(userId, TOPUP_S);
+        await grantPro(userId, license_key);
+        await addPaidSeconds(userId, TOPUP_S);
         return reply.send({ ok:true, purchase: json.purchase });
       }
       return reply.code(402).send({ ok:false, error:'License invalid', details: json });

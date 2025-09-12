@@ -7,7 +7,7 @@ import fastifyWs from '@fastify/websocket';
 import gumroadPlugin from './src/plugins/gumroad.mjs';
 import { initDb } from './src/lib/db.mjs';
 import { findOrCreateByPhone } from './src/lib/contacts.mjs';
-import { totalSecondsLeft, deductSeconds, ensureEntitlement, upgradeEntitlementFromContact } from './src/lib/license.mjs';
+import { totalSecondsLeft, deductSeconds, ensureEntitlement, upgradeEntitlementFromContact, ensureInitialTrialTopup } from './src/lib/license.mjs';
 import twilio from 'twilio';
 // Stripe import intentionally omitted (optional later) to avoid runtime dep
 
@@ -186,7 +186,7 @@ fastify.get('/billing/remaining', async (request, reply) => {
     }
     const userId = request.query?.userId || request.query?.phone || request.query?.caller || '';
     if (!userId) return reply.code(400).send({ ok:false, error: 'missing userId|phone|caller' });
-    const ent = ensureEntitlement(userId);
+    const ent = await ensureEntitlement(userId);
     const total = Math.max(0, (ent.trialLeft || 0) + (ent.paidLeft || 0));
     reply.send({ ok:true, userId, trialLeft: ent.trialLeft || 0, paidLeft: ent.paidLeft || 0, totalLeft: total });
 });
@@ -203,7 +203,7 @@ fastify.all('/incoming-call', async (request, reply) => {
       const res = await findOrCreateByPhone(from);
       if (res?.contact) {
         contactWid = res.contact.wid || '';
-        const ent = upgradeEntitlementFromContact(from, res.contact);
+        const ent = await upgradeEntitlementFromContact(from, res.contact);
         isUnlimited = !!res.contact.is_unlimited;
         console.log('[Call] Contact mapped', { from, wid: contactWid, created: !!res.created, unlimited: isUnlimited, paidLeft: ent.paidLeft, trialLeft: ent.trialLeft });
       } else {
@@ -213,8 +213,20 @@ fastify.all('/incoming-call', async (request, reply) => {
       console.warn('[Call] Contact lookup failed', e?.message || e);
     }
 
-    ensureEntitlement(from);
-    const secondsLeft = totalSecondsLeft(from);
+    // One-time initial trial as RBT top-up (idempotent)
+    try {
+      const grant = await ensureInitialTrialTopup(from);
+      if (grant?.ok) {
+        console.log('[Call] Trial granted as top-up', grant);
+      } else if (grant?.reason) {
+        console.log('[Call] Trial top-up skipped', grant.reason);
+      }
+    } catch (e) {
+      console.warn('[Call] Trial top-up error', e?.message || e);
+    }
+
+    await ensureEntitlement(from);
+    const secondsLeft = await totalSecondsLeft(from);
 
     console.log(`Incoming call from ${from || 'unknown'} — seconds remaining: ${secondsLeft}s`);
 
@@ -300,7 +312,7 @@ fastify.register(async (fastify) => {
         let cutoffTimer = null;
         let billed = false; // ensure we only deduct once per connection
 
-        const billUsage = (reason = 'unknown') => {
+        const billUsage = async (reason = 'unknown') => {
             if (billed) return;
             if (!caller) {
                 console.warn(`[Billing] skip (${reason}): missing caller`);
@@ -320,8 +332,12 @@ fastify.register(async (fastify) => {
                 console.log(`[Billing] skip deduction (${reason}): unlimited user ${caller} (${seconds}s)`);
                 return;
             }
-            const ent = deductSeconds(caller, seconds);
-            console.log(`Usage deducted ${seconds}s for ${caller} [${reason}]. TrialLeft=${ent.trialLeft}s PaidLeft=${ent.paidLeft}s`);
+            try {
+                const ent = await deductSeconds(caller, seconds, { reason });
+                console.log(`Usage deducted ${seconds}s for ${caller} [${reason}]. TrialLeft=${ent.trialLeft}s PaidLeft=${ent.paidLeft}s`);
+            } catch (e) {
+                console.warn('Deduct failed', e?.message || e);
+            }
         };
 
         let hasActiveResponse = false;
