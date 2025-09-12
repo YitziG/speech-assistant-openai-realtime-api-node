@@ -107,6 +107,15 @@ node index.js
 ## Test the app
 With the development server running, call the phone number you purchased in the **Prerequisites**. After the introduction, you should be able to talk to the AI Assistant. Have fun!
 
+## Direct Twilio SIP to OpenAI
+Skip the WebSocket relay and let OpenAI host the call:
+
+1. Point a Twilio SIP Trunk to `sip:<your-project-id>@sip.api.openai.com;transport=tls`.
+2. In the OpenAI dashboard, add a webhook for the `realtime.call.incoming` event and set the URL to `https://<your-server>/openai-sip`.
+3. Deploy this app with `OPENAI_API_KEY` set. The `/openai-sip` endpoint accepts the call and attaches an [Agents SDK](https://openai.github.io/openai-agents-js/) session with the same system prompt and Alloy voice.
+
+This allows Twilio to provide phone numbers while OpenAI handles the media and agent logic.
+
 ## Special features
 
 ### Have the AI speak first
