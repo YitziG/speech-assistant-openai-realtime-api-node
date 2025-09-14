@@ -228,17 +228,24 @@ fastify.post('/openai-sip', async (request, reply) => {
         // Accept the call then attach a session using the Agents SDK
         (async () => {
             try {
-                await fetch(`https://api.openai.com/v1/realtime/calls/${callId}/accept`, {
+                const acceptRes = await fetch(`https://api.openai.com/v1/realtime/calls/${callId}/accept`, {
                     method: 'POST',
                     headers: {
                         'Authorization': `Bearer ${OPENAI_API_KEY}`,
                         'Content-Type': 'application/json',
                     },
                     body: JSON.stringify({
+                        // Per Realtime SIP docs: explicitly set type/model and config
+                        type: 'realtime',
+                        model: 'gpt-realtime',
                         voice: 'alloy',
                         instructions: SYSTEM_MESSAGE,
                     }),
                 });
+                if (!acceptRes.ok) {
+                    const bodyText = await acceptRes.text().catch(() => '');
+                    throw new Error(`SIP accept failed: ${acceptRes.status} ${acceptRes.statusText} ${bodyText}`);
+                }
 
                 const agent = new RealtimeAgent({
                     name: 'Rabbot',
@@ -246,17 +253,21 @@ fastify.post('/openai-sip', async (request, reply) => {
                 });
 
                 const session = new RealtimeSession(agent, {
-
                     model: 'gpt-realtime',
-
                     transport: new OpenAIRealtimeWebSocket({
-                        url: `wss://api.openai.com/v1/realtime/calls/${callId}`,
+                        // SIP monitoring WS: connect with call_id query param
+                        url: `wss://api.openai.com/v1/realtime?call_id=${callId}`,
                     }),
                     config: {
                         audio: {
                             output: { voice: 'alloy' },
                         },
                     },
+                });
+
+                // Avoid crashing on emitter 'error' events; log instead
+                session.on('error', (err) => {
+                    fastify.log.error({ err }, 'Realtime SIP session error');
                 });
 
                 session.connect({ apiKey: OPENAI_API_KEY }).catch(err =>
