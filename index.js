@@ -216,6 +216,10 @@ fastify.post('/openai-sip', async (request, reply) => {
     const event = request.body;
     if (event?.type === 'realtime.call.incoming') {
         const callId = event.data?.id;
+        if (!callId) {
+            fastify.log.error({ event }, 'Missing callId in realtime.call.incoming event');
+            return reply.code(400).send({ ok: false, error: 'missing callId' });
+        }
         // Accept the call then attach a session using the Agents SDK
         (async () => {
             try {
