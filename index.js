@@ -28,19 +28,22 @@ const {
     PER_CALL_CAP_SECONDS = '600',
     ADMIN_TOKEN,
     // Optional VAD tuning
-    VAD_THRESHOLD = '0.7',
+    VAD_THRESHOLD = '0.4',
     VAD_SILENCE_MS = '500',
     VAD_PREFIX_MS = '200',
     // Optional fast barge-in tuning (local heuristic)
-    FAST_BARGE = 'off',
+    FAST_BARGE = 'on',
     FAST_BARGE_MIN_NON_SILENT = '44',
     FAST_BARGE_WINDOW_BYTES = '160',
     FAST_BARGE_COOLDOWN_MS = '250',
-    FAST_BARGE_FRAMES = '3',
-    FAST_BARGE_START_GUARD_MS = '1200',
+    FAST_BARGE_FRAMES = '2',
+    FAST_BARGE_START_GUARD_MS = '200',
     // VAD mode: 'server' (default) or 'semantic'
     VAD_MODE = 'server',
     VAD_SEMANTIC_EAGERNESS = 'auto',
+    // Local barge-in energy thresholds (μ-law decoded avg abs amplitude)
+    FAST_BARGE_ABS_THRESH = '3500',
+    FAST_BARGE_RATIO = '1.2',
 
 } = process.env;
 
@@ -212,6 +215,7 @@ fastify.get('/billing/remaining', async (request, reply) => {
 fastify.post('/openai-sip', async (request, reply) => {
     const event = request.body;
     if (event?.type === 'realtime.call.incoming') {
+
         // The webhook payload places the call identifier in `data.call_id`.
         const callId = event.data?.call_id || event.data?.id;
 
@@ -242,7 +246,9 @@ fastify.post('/openai-sip', async (request, reply) => {
                 });
 
                 const session = new RealtimeSession(agent, {
-                    model: 'gpt-4o-realtime-preview',
+
+                    model: 'gpt-realtime',
+
                     transport: new OpenAIRealtimeWebSocket({
                         url: `wss://api.openai.com/v1/realtime/calls/${callId}`,
                     }),
@@ -422,6 +428,9 @@ fastify.register(async (fastify) => {
         let fastBargeCount = 0;
         // Track how many assistant audio bytes we've actually forwarded to Twilio for the current response
         let assistantBytesSent = 0;
+        // Track assistant audio energy (avg abs amplitude, EMA)
+        let assistantOutAvgAbsEma = 0;
+        const ema = (prev, v, a) => (prev === 0 ? v : (prev * (1 - a) + v * a));
 
         // 🔥 Low-latency auto-commit (server-VAD style)
         let hasUncommittedAudio = false;
@@ -445,6 +454,23 @@ fastify.register(async (fastify) => {
         const send = (obj) => openAiWs.readyState === WebSocket.OPEN && openAiWs.send(JSON.stringify(obj));
 
         const now = () => Date.now();
+
+        // μ-law decode to linear 16-bit approx; return average absolute amplitude
+        const muLawAvgAbs = (buf, limit) => {
+            const n = Math.min(buf.length, Math.max(1, limit || buf.length));
+            let sum = 0;
+            for (let i = 0; i < n; i++) {
+                const u = (~buf[i]) & 0xff;
+                const sign = u & 0x80;
+                const exponent = (u >> 4) & 0x07;
+                const mantissa = u & 0x0f;
+                let magnitude = ((mantissa << 4) + 0x08) << (exponent + 3);
+                let pcm = magnitude - 0x84;
+                if (sign) pcm = -pcm;
+                sum += (pcm < 0 ? -pcm : pcm);
+            }
+            return sum / n;
+        };
 
         const sendMark = () => {
             if (!streamSid) return;
@@ -519,6 +545,7 @@ fastify.register(async (fastify) => {
                     audio: {
                         input: {
                             format: {type: 'audio/pcmu'},
+                            noise_reduction: { type: 'near_field' },
                             // Move VAD config back under audio.input to satisfy GA shape
                             turn_detection: (() => {
                                 const mode = String(VAD_MODE || 'server').toLowerCase();
@@ -699,6 +726,13 @@ fastify.register(async (fastify) => {
                     // Count bytes forwarded (PCMU 8kHz: 8000 bytes ≈ 1000ms)
                     assistantBytesSent += Buffer.from(response.delta, 'base64').length;
                 } catch {}
+                // Update outgoing energy EMA for echo discrimination
+                try {
+                    const outBuf = Buffer.from(response.delta, 'base64');
+                    const win = Math.max(1, Number(FAST_BARGE_WINDOW_BYTES) || 160);
+                    const outAvg = muLawAvgAbs(outBuf, win);
+                    assistantOutAvgAbsEma = ema(assistantOutAvgAbsEma, outAvg, 0.35);
+                } catch {}
 
                 if (!responseStartTimestampTwilio) {
                     responseStartTimestampTwilio = latestMediaTimestamp;
@@ -739,6 +773,7 @@ fastify.register(async (fastify) => {
 
             // Barge-in cues
             if (response.type === 'input_audio_buffer.speech_started') {
+                try { console.log('[BARGE] server VAD speech_started'); } catch {}
                 handleSpeechStartedEvent();
             }
             if (response.type === 'input_audio_buffer.speech_stopped' || response.type === 'input_audio_buffer.committed') {
@@ -897,18 +932,19 @@ fastify.register(async (fastify) => {
                             if (since > (Number(FAST_BARGE_COOLDOWN_MS) || 250) && sinceStart > guardMs) {
                                 const b64 = data.media.payload;
                                 const buf = Buffer.from(b64, 'base64');
-                                let nonSilent = 0;
                                 const win = Math.max(1, Number(FAST_BARGE_WINDOW_BYTES) || 160);
                                 const len = Math.min(buf.length, win);
-                                for (let i = 0; i < len; i++) {
-                                    const v = buf[i];
-                                    if (v !== 0xFF && v !== 0x7F && v !== 0x00 && v !== 0x80) nonSilent++;
-                                }
-                                if (nonSilent > (Number(FAST_BARGE_MIN_NON_SILENT) || 28)) {
+                                // μ-law energy of inbound frame
+                                const inAvg = muLawAvgAbs(buf, len);
+                                const absThresh = Number(FAST_BARGE_ABS_THRESH) || 5000;
+                                const ratio = Number(FAST_BARGE_RATIO) || 1.6;
+                                const echoFloor = assistantOutAvgAbsEma * ratio;
+                                const passesEnergy = inAvg > Math.max(absThresh, echoFloor);
+                                if (passesEnergy) {
                                     fastBargeCount += 1;
                                     if (fastBargeCount >= (Number(FAST_BARGE_FRAMES) || 2)) {
                                         // Lightweight log: local heuristic barge triggered
-                                        try { console.log(`[BARGE] local trigger nonSilent=${nonSilent} len=${len} frames=${fastBargeCount}`); } catch {}
+                                        try { console.log(`[BARGE] local trigger inAvg=${inAvg.toFixed(0)} outEma=${assistantOutAvgAbsEma.toFixed(0)} ratio=${ratio} guardMs=${guardMs}`); } catch {}
                                         lastLocalBargeTs = now();
                                         handleSpeechStartedEvent();
                                         fastBargeCount = 0;
