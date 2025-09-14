@@ -27,7 +27,7 @@ const {
     PER_CALL_CAP_SECONDS = '600',
     ADMIN_TOKEN,
     // Optional VAD tuning
-    VAD_THRESHOLD = '0.5',
+    VAD_THRESHOLD = '0.4',
     VAD_SILENCE_MS = '500',
     VAD_PREFIX_MS = '200',
     // Optional fast barge-in tuning (local heuristic)
@@ -35,14 +35,14 @@ const {
     FAST_BARGE_MIN_NON_SILENT = '44',
     FAST_BARGE_WINDOW_BYTES = '160',
     FAST_BARGE_COOLDOWN_MS = '250',
-    FAST_BARGE_FRAMES = '3',
-    FAST_BARGE_START_GUARD_MS = '600',
+    FAST_BARGE_FRAMES = '2',
+    FAST_BARGE_START_GUARD_MS = '200',
     // VAD mode: 'server' (default) or 'semantic'
     VAD_MODE = 'server',
     VAD_SEMANTIC_EAGERNESS = 'auto',
     // Local barge-in energy thresholds (μ-law decoded avg abs amplitude)
-    FAST_BARGE_ABS_THRESH = '5000',
-    FAST_BARGE_RATIO = '1.6',
+    FAST_BARGE_ABS_THRESH = '3500',
+    FAST_BARGE_RATIO = '1.2',
 
 } = process.env;
 
