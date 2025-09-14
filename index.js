@@ -27,6 +27,9 @@ const {
     TRIAL_SECONDS = '300',
     PER_CALL_CAP_SECONDS = '600',
     ADMIN_TOKEN,
+    // Optional OpenAI project and voice overrides
+    OPENAI_PROJECT_ID,
+    RABBOT_VOICE,
     // Optional VAD tuning
     VAD_THRESHOLD = '0.4',
     VAD_SILENCE_MS = '500',
@@ -167,7 +170,7 @@ Closers: “Anything else on your mind?” / “Happy to help next time.”
 
 
 // Voice, temperature, etc
-const VOICE = 'cedar';
+const VOICE = 'cedar'
 const TEMPERATURE = Number('0.8');
 
 // Event logging
@@ -246,7 +249,7 @@ fastify.post('/openai-sip', async (request, reply) => {
                         // Per Realtime SIP docs: explicitly set type/model and config
                         type: 'realtime',
                         model: 'gpt-realtime',
-                        voice: 'alloy',
+                        voice: VOICE,
                         instructions: SYSTEM_MESSAGE,
                     }),
                 });
@@ -269,26 +272,23 @@ fastify.post('/openai-sip', async (request, reply) => {
                 fastify.log.info({ callId, status: acceptRes.status, accept: acceptBody, headers: acceptHeaders }, 'SIP accept OK');
 
                 // Optionally attach a lightweight WS to trigger a greeting.
-                const connectSIPEventsWs = (id, attempt = 0, hostIdx = 0, styleIdx = 0) => {
-                    const hosts = ['api.openai.com', 'transceiver.api.openai.com'];
-                    const styles = [
-                        (h, cid) => `wss://${h}/v1/realtime?call_id=${cid}`,
-                        (h, cid) => `wss://${h}/v1/realtime/calls/${cid}`,
-                    ];
-                    const host = hosts[Math.min(hostIdx, hosts.length - 1)];
-                    const style = styles[Math.min(styleIdx, styles.length - 1)];
-                    const url = style(host, id);
-                    fastify.log.info({ callId: id, url, attempt, host, styleIdx }, 'Connecting SIP events WS');
+                const connectSIPEventsWs = (id) => {
+                    const wsUrl = `wss://api.openai.com/v1/realtime?call_id=${encodeURIComponent(id)}`;
+                    fastify.log.info({ callId: id, url: wsUrl }, 'Connecting SIP events WS');
 
-                    const ws = new WebSocket(url, {
+                    const ws = new WebSocket(wsUrl, {
                         headers: {
                             Authorization: `Bearer ${OPENAI_API_KEY}`,
                             'OpenAI-Beta': 'realtime=v1',
+                            // Node 'ws' does not set Origin; OpenAI expects one
+                            origin: 'https://api.openai.com',
+                            // Helpful if your key is not a project-scoped key
+                            ...(OPENAI_PROJECT_ID ? { 'OpenAI-Project': OPENAI_PROJECT_ID } : {}),
                         },
                     });
 
                     ws.on('open', () => {
-                        fastify.log.info({ callId: id, url }, 'SIP events WS opened');
+                        fastify.log.info({ callId: id, url: wsUrl }, 'SIP events WS opened');
                         // Send an initial greeting so callers hear something immediately
                         const greeting = {
                             type: 'response.create',
@@ -308,32 +308,13 @@ fastify.post('/openai-sip', async (request, reply) => {
                     });
                     ws.on('error', (err) => {
                         fastify.log.info({ err, type: 'error' }, 'Realtime SIP session error');
-                        const msg = String(err?.message || '');
-                        // Rotate through host + path styles, then backoff
-                        const is4xx = msg.includes('400') || msg.includes('404');
-                        if (is4xx) {
-                            if (hostIdx < hosts.length - 1) {
-                                // Try alternate host immediately
-                                setTimeout(() => connectSIPEventsWs(id, attempt, hostIdx + 1, styleIdx), 50);
-                                return;
-                            }
-                            if (styleIdx < styles.length - 1) {
-                                // Try alternate path style
-                                setTimeout(() => connectSIPEventsWs(id, attempt, 0, styleIdx + 1), 50);
-                                return;
-                            }
-                            if (attempt < 5) {
-                                const delay = 300 + attempt * 350;
-                                setTimeout(() => connectSIPEventsWs(id, attempt + 1, 0, 0), delay);
-                            }
-                        }
                     });
                     ws.on('close', (code, reason) => {
                         fastify.log.info({ callId: id, code, reason: String(reason || '') }, 'SIP events WS closed');
                     });
                 };
-                // Try after a short delay; then fallback/retry logic will handle
-                setTimeout(() => connectSIPEventsWs(callId, 0, 0, 0), 150);
+                // Connect after a short delay
+                setTimeout(() => connectSIPEventsWs(callId), 150);
             } catch (err) {
                 fastify.log.error({ err }, 'Failed to accept SIP call');
             }
