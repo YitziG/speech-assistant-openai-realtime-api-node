@@ -234,7 +234,7 @@ fastify.post('/openai-sip', async (request, reply) => {
                 });
 
                 const session = new RealtimeSession(agent, {
-                    model: 'gpt-4o-realtime-preview',
+                    model: 'gpt-realtime',
                     transport: new OpenAIRealtimeWebSocket({
                         url: `wss://api.openai.com/v1/realtime/calls/${callId}`,
                     }),
