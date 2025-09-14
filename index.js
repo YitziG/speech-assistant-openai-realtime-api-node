@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import process from 'node:process';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
+import { RealtimeAgent, RealtimeSession, OpenAIRealtimeWebSocket } from '@openai/agents/realtime';
 import gumroadPlugin from './src/plugins/gumroad.mjs';
 import { initDb } from './src/lib/db.mjs';
 import { findOrCreateByPhone } from './src/lib/contacts.mjs';
@@ -205,6 +206,61 @@ fastify.get('/billing/remaining', async (request, reply) => {
     const ent = await ensureEntitlement(userId);
     const total = Math.max(0, (ent.trialLeft || 0) + (ent.paidLeft || 0));
     reply.send({ ok:true, userId, trialLeft: ent.trialLeft || 0, paidLeft: ent.paidLeft || 0, totalLeft: total });
+});
+
+// OpenAI Realtime SIP webhook
+fastify.post('/openai-sip', async (request, reply) => {
+    const event = request.body;
+    if (event?.type === 'realtime.call.incoming') {
+        // The webhook payload places the call identifier in `data.call_id`.
+        const callId = event.data?.call_id || event.data?.id;
+
+        if (!callId) {
+            fastify.log.info({ event }, 'Missing callId in realtime.call.incoming event');
+            reply.code(400).send({ ok: false, error: 'missing callId' });
+            return;
+        }
+
+        // Accept the call then attach a session using the Agents SDK
+        (async () => {
+            try {
+                await fetch(`https://api.openai.com/v1/realtime/calls/${callId}/accept`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        voice: 'alloy',
+                        instructions: SYSTEM_MESSAGE,
+                    }),
+                });
+
+                const agent = new RealtimeAgent({
+                    name: 'Rabbot',
+                    instructions: SYSTEM_MESSAGE,
+                });
+
+                const session = new RealtimeSession(agent, {
+                    model: 'gpt-4o-realtime-preview',
+                    transport: new OpenAIRealtimeWebSocket({
+                        url: `wss://api.openai.com/v1/realtime/calls/${callId}`,
+                    }),
+                    config: {
+                        audio: {
+                            output: { voice: 'alloy' },
+                        },
+                    },
+                });
+
+                session.connect({ apiKey: OPENAI_API_KEY }).catch(err =>
+                    fastify.log.error({ err }, 'Failed to connect SIP session'));
+            } catch (err) {
+                fastify.log.error({ err }, 'Failed to accept SIP call');
+            }
+        })();
+    }
+    reply.send({ ok: true });
 });
 
 // Twilio webhook: connect media stream
