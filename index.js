@@ -225,9 +225,10 @@ fastify.post('/openai-sip', async (request, reply) => {
             return;
         }
 
-        // Accept the call then attach a session using the Agents SDK
+        // Accept the call then attach a session using the SIP events WS
         (async () => {
             try {
+                fastify.log.info({ callId }, 'SIP incoming: accepting call');
                 const acceptRes = await fetch(`https://api.openai.com/v1/realtime/calls/${callId}/accept`, {
                     method: 'POST',
                     headers: {
@@ -247,6 +248,7 @@ fastify.post('/openai-sip', async (request, reply) => {
                     const bodyText = await acceptRes.text().catch(() => '');
                     throw new Error(`SIP accept failed: ${acceptRes.status} ${acceptRes.statusText} ${bodyText}`);
                 }
+                fastify.log.info({ callId, status: acceptRes.status }, 'SIP accept OK');
 
                 // Optionally attach a lightweight WS to trigger a greeting.
                 const connectSIPEventsWs = (id, attempt = 0) => {
@@ -259,6 +261,7 @@ fastify.post('/openai-sip', async (request, reply) => {
                         });
 
                     ws.on('open', () => {
+                        fastify.log.info({ callId: id }, 'SIP events WS opened');
                         // Send an initial greeting so callers hear something immediately
                         const greeting = {
                             type: 'response.create',
@@ -268,6 +271,15 @@ fastify.post('/openai-sip', async (request, reply) => {
                         };
                         try { ws.send(JSON.stringify(greeting)); } catch {}
                     });
+                    ws.on('message', (msg) => {
+                        try {
+                            const ev = JSON.parse(msg);
+                            const t = ev?.type || 'unknown';
+                            if (t === 'session.created' || t === 'response.created' || t === 'response.done' || t === 'error') {
+                                fastify.log.info({ callId: id, type: t }, 'SIP events');
+                            }
+                        } catch {}
+                    });
                     ws.on('error', (err) => {
                         fastify.log.info({ err, type: 'error' }, 'Realtime SIP session error');
                         const msg = String(err?.message || '');
@@ -276,7 +288,9 @@ fastify.post('/openai-sip', async (request, reply) => {
                             setTimeout(() => connectSIPEventsWs(id, attempt + 1), delay);
                         }
                     });
-                    ws.on('close', () => { /* noop */ });
+                    ws.on('close', (code, reason) => {
+                        fastify.log.info({ callId: id, code, reason: String(reason || '') }, 'SIP events WS closed');
+                    });
                 };
                 // Try immediately; if backend not ready, retry logic will backoff a few times
                 connectSIPEventsWs(callId, 0);
