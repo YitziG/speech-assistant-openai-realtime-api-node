@@ -170,7 +170,7 @@ Closers: “Anything else on your mind?” / “Happy to help next time.”
 
 
 // Voice, temperature, etc
-const VOICE = 'cedar'
+const VOICE = (RABBOT_VOICE && String(RABBOT_VOICE).trim()) ? String(RABBOT_VOICE).trim() : 'cedar';
 const TEMPERATURE = Number('0.8');
 
 // Event logging
@@ -216,6 +216,8 @@ fastify.get('/billing/remaining', async (request, reply) => {
 
 // OpenAI Realtime SIP webhook
 fastify.post('/openai-sip', async (request, reply) => {
+    // Echo Authorization on 200 to keep session alive (per Twilio SIP guide)
+    try { reply.header('Authorization', `Bearer ${OPENAI_API_KEY}`); } catch {}
     const event = request.body;
     if (event?.type === 'realtime.call.incoming') {
 
@@ -239,18 +241,21 @@ fastify.post('/openai-sip', async (request, reply) => {
         (async () => {
             try {
                 fastify.log.info({ callId }, 'SIP incoming: accepting call');
-                const acceptRes = await fetch(`https://api.openai.com/v1/realtime/calls/${callId}/accept`, {
+                const acceptRes = await fetch(`https://api.openai.com/v1/realtime/calls/${encodeURIComponent(callId)}/accept`, {
                     method: 'POST',
                     headers: {
                         'Authorization': `Bearer ${OPENAI_API_KEY}`,
                         'Content-Type': 'application/json',
                     },
                     body: JSON.stringify({
-                        // Per Realtime SIP docs: explicitly set type/model and config
+                        // Per Realtime SIP docs: explicitly set type/model and SIP audio config
                         type: 'realtime',
                         model: 'gpt-realtime',
-                        voice: VOICE,
                         instructions: SYSTEM_MESSAGE,
+                        audio: {
+                            input:  { format: 'g711_ulaw' },
+                            output: { format: 'g711_ulaw', voice: VOICE },
+                        },
                     }),
                 });
                 if (!acceptRes.ok) {
