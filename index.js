@@ -233,6 +233,7 @@ fastify.post('/openai-sip', async (request, reply) => {
                     headers: {
                         'Authorization': `Bearer ${OPENAI_API_KEY}`,
                         'Content-Type': 'application/json',
+                        'OpenAI-Beta': 'realtime=v1',
                     },
                     body: JSON.stringify({
                         // Per Realtime SIP docs: explicitly set type/model and config
@@ -247,31 +248,38 @@ fastify.post('/openai-sip', async (request, reply) => {
                     throw new Error(`SIP accept failed: ${acceptRes.status} ${acceptRes.statusText} ${bodyText}`);
                 }
 
-                const agent = new RealtimeAgent({
-                    name: 'Rabbot',
-                    instructions: SYSTEM_MESSAGE,
-                });
+                // Optionally attach a lightweight WS to trigger a greeting.
+                const connectSIPEventsWs = (id, attempt = 0) => {
+                    const ws = new WebSocket(`wss://api.openai.com/v1/realtime?call_id=${id}`,
+                        {
+                            headers: {
+                                Authorization: `Bearer ${OPENAI_API_KEY}`,
+                                'OpenAI-Beta': 'realtime=v1',
+                            },
+                        });
 
-                const session = new RealtimeSession(agent, {
-                    model: 'gpt-realtime',
-                    transport: new OpenAIRealtimeWebSocket({
-                        // SIP monitoring WS: connect with call_id query param
-                        url: `wss://api.openai.com/v1/realtime?call_id=${callId}`,
-                    }),
-                    config: {
-                        audio: {
-                            output: { voice: 'alloy' },
-                        },
-                    },
-                });
-
-                // Avoid crashing on emitter 'error' events; log instead
-                session.on('error', (err) => {
-                    fastify.log.error({ err }, 'Realtime SIP session error');
-                });
-
-                session.connect({ apiKey: OPENAI_API_KEY }).catch(err =>
-                    fastify.log.error({ err }, 'Failed to connect SIP session'));
+                    ws.on('open', () => {
+                        // Send an initial greeting so callers hear something immediately
+                        const greeting = {
+                            type: 'response.create',
+                            response: {
+                                instructions: 'Thank you for calling, how can I help you?',
+                            },
+                        };
+                        try { ws.send(JSON.stringify(greeting)); } catch {}
+                    });
+                    ws.on('error', (err) => {
+                        fastify.log.info({ err, type: 'error' }, 'Realtime SIP session error');
+                        const msg = String(err?.message || '');
+                        if ((msg.includes('400') || msg.includes('404')) && attempt < 5) {
+                            const delay = 250 + attempt * 250;
+                            setTimeout(() => connectSIPEventsWs(id, attempt + 1), delay);
+                        }
+                    });
+                    ws.on('close', () => { /* noop */ });
+                };
+                // Try immediately; if backend not ready, retry logic will backoff a few times
+                connectSIPEventsWs(callId, 0);
             } catch (err) {
                 fastify.log.error({ err }, 'Failed to accept SIP call');
             }
@@ -457,6 +465,7 @@ fastify.register(async (fastify) => {
             `wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${TEMPERATURE}`, {
                 headers: {
                     Authorization: `Bearer ${OPENAI_API_KEY}`,
+                    'OpenAI-Beta': 'realtime=v1',
                 },
             },);
 
