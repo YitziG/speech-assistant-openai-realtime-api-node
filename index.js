@@ -215,11 +215,16 @@ fastify.get('/billing/remaining', async (request, reply) => {
 fastify.post('/openai-sip', async (request, reply) => {
     const event = request.body;
     if (event?.type === 'realtime.call.incoming') {
-        const callId = event.data?.id;
+
+        // The webhook payload places the call identifier in `data.call_id`.
+        const callId = event.data?.call_id || event.data?.id;
+
         if (!callId) {
-            fastify.log.error({ event }, 'Missing callId in realtime.call.incoming event');
-            return reply.code(400).send({ ok: false, error: 'missing callId' });
+            fastify.log.info({ event }, 'Missing callId in realtime.call.incoming event');
+            reply.code(400).send({ ok: false, error: 'missing callId' });
+            return;
         }
+
         // Accept the call then attach a session using the Agents SDK
         (async () => {
             try {
@@ -241,7 +246,9 @@ fastify.post('/openai-sip', async (request, reply) => {
                 });
 
                 const session = new RealtimeSession(agent, {
+
                     model: 'gpt-realtime',
+
                     transport: new OpenAIRealtimeWebSocket({
                         url: `wss://api.openai.com/v1/realtime/calls/${callId}`,
                     }),
