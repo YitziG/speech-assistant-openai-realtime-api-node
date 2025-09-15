@@ -1,11 +1,12 @@
 import Fastify from 'fastify';
-import WebSocket from 'ws';
 import dotenv from 'dotenv';
 import process from 'node:process';
 import fastifyFormBody from '@fastify/formbody';
 import gumroadPlugin from './src/plugins/gumroad.mjs';
 import {initDb} from './src/lib/db.mjs';
-import {ensureEntitlement} from './src/lib/license.mjs';
+import {ensureEntitlement, totalSecondsLeft, deductSeconds, ensureInitialTrialTopup} from './src/lib/license.mjs';
+import { normalizeDigits } from './src/lib/contacts.mjs';
+import { RealtimeAgent, RealtimeSession } from '@openai/agents/realtime';
 
 // Load environment variables
 dotenv.config();
@@ -157,6 +158,45 @@ fastify.post('/openai-sip', async (request, reply) => {
     if (event?.type === 'realtime.call.incoming') {
         // The webhook payload places the call identifier in `data.call_id`.
         const callId = event.data?.call_id || event.data?.id;
+        const sipHeaders = Array.isArray(event?.data?.sip_headers) ? event.data.sip_headers : [];
+
+        // Helper: find a caller identifier (E.164 or digits) from SIP headers
+        function extractCallerFromSipHeaders(headers) {
+            try {
+                const map = new Map();
+                for (const h of headers) {
+                    const name = String(h?.name || '').toLowerCase();
+                    const value = String(h?.value || '');
+                    if (!name) continue;
+                    map.set(name, value);
+                }
+                // Priority order of common caller-id sources
+                const candidates = [
+                    map.get('x-user-id'),
+                    map.get('x-user-phone'),
+                    map.get('x-twilio-from'),
+                    map.get('p-asserted-identity'),
+                    map.get('remote-party-id'),
+                    map.get('from'),
+                    map.get('caller'),
+                ].filter(Boolean);
+                for (const raw of candidates) {
+                    // Pull first +digits or long digit run
+                    const m = String(raw).match(/\+?\d{6,}/);
+                    if (m) return normalizeDigits(m[0]);
+                    // Fallback: inside angle brackets <sip:+1...>
+                    const m2 = String(raw).match(/<[^>]*>/);
+                    if (m2) {
+                        const d = normalizeDigits(m2[0]);
+                        if (d) return d;
+                    }
+                }
+            } catch {}
+            return '';
+        }
+
+        const userDigits = extractCallerFromSipHeaders(sipHeaders);
+        const userId = userDigits || 'anonymous';
 
         if (!callId) {
             fastify.log.info({event}, 'Missing callId in realtime.call.incoming event');
@@ -171,7 +211,7 @@ fastify.post('/openai-sip', async (request, reply) => {
             return;
         }
 
-        // Accept the call then (optionally) attach a session using the SIP events WS
+        // Accept the call then attach a Realtime Agents session over SIP events WS
         (async () => {
             try {
                 fastify.log.info({callId}, 'SIP incoming: accepting call');
@@ -188,8 +228,8 @@ fastify.post('/openai-sip', async (request, reply) => {
                             model: 'gpt-realtime',
                             instructions: SYSTEM_MESSAGE,
                             audio: {
-                                input: {format: 'g711_ulaw'},
-                                output: {format: 'g711_ulaw', voice: VOICE},
+                                input: { format: 'g711_ulaw' },
+                                output: { format: 'g711_ulaw', voice: VOICE },
                             },
                         }),
                     }
@@ -218,57 +258,256 @@ fastify.post('/openai-sip', async (request, reply) => {
                     'SIP accept OK'
                 );
 
-                // Optionally attach a lightweight WS to trigger a greeting.
-                const connectSIPEventsWs = (id) => {
+                // Attach a Realtime Agents session via WebSocket to the SIP call
+                const attachAgentsSession = async (id) => {
                     const wsUrl = `wss://api.openai.com/v1/realtime?call_id=${encodeURIComponent(id)}`;
-                    fastify.log.info({callId: id, url: wsUrl}, 'Connecting SIP events WS');
+                    fastify.log.info({ callId: id, url: wsUrl }, 'Connecting Realtime Agents session');
 
-                    const ws = new WebSocket(wsUrl, {
-                        headers: {
-                            Authorization: `Bearer ${OPENAI_API_KEY}`,
-                            'OpenAI-Beta': 'realtime=v1',
-                            ...(OPENAI_PROJECT_ID ? {'OpenAI-Project': OPENAI_PROJECT_ID} : {}),
+                    // Build the agent and session with SIP-safe audio settings
+                    const agent = new RealtimeAgent({
+                        name: 'The Rabbot',
+                        instructions: SYSTEM_MESSAGE,
+                    });
+
+                    const session = new RealtimeSession(agent, {
+                        transport: 'websocket',
+                        model: 'gpt-realtime',
+                        // Ensure g711/PCMU audio for SIP and set voice
+                        config: {
+                            outputModalities: ['audio'],
+                            audio: {
+                                input: { format: { type: 'audio/pcmu' } },
+                                output: { format: { type: 'audio/pcmu' }, voice: VOICE },
+                            },
                         },
-                        // Some stacks expect an Origin
-                        origin: 'https://api.openai.com',
                     });
 
-                    ws.on('open', () => {
-                        fastify.log.info({callId: id, url: wsUrl}, 'SIP events WS opened');
-                        // Send an initial greeting so callers hear something immediately
-                        const greeting = {
-                            type: 'response.create',
-                            response: {instructions: 'Thank you for calling, how can I help you?'},
-                        };
-                        try {
-                            ws.send(JSON.stringify(greeting));
-                        } catch {
-                        }
+                    // Basic observability
+                    session.transport.on('connected', () => {
+                        fastify.log.info({ callId: id }, 'Agents session connected');
+                    });
+                    session.transport.on('disconnected', () => {
+                        fastify.log.info({ callId: id }, 'Agents session disconnected');
+                    });
+                    session.on('error', (err) => {
+                        fastify.log.error({ callId: id, err }, 'Agents session error');
                     });
 
-                    ws.on('message', (msg) => {
+                    // Live billing: wall-clock deduction during the call
+                    const TICK_SECONDS = Number(process.env.BILLING_TICK_SECONDS || '10');
+                    let billingTimer = null;
+                    let ended = false;
+
+                    async function hangupSipCall(callIdToEnd) {
                         try {
-                            const ev = JSON.parse(msg);
-                            const t = ev?.type || 'unknown';
-                            if (t === 'error') fastify.log.error({callId: id, event: ev}, 'SIP events ERROR');
-                            else if (t === 'session.created' || t === 'response.created' || t === 'response.done') {
-                                fastify.log.info({callId: id, type: t}, 'SIP events');
+                            const res = await fetch(`https://api.openai.com/v1/realtime/calls/${encodeURIComponent(callIdToEnd)}/hangup`, {
+                                method: 'POST',
+                                headers: {
+                                    Authorization: `Bearer ${OPENAI_API_KEY}`,
+                                    'Content-Type': 'application/json',
+                                    ...(OPENAI_PROJECT_ID ? {'OpenAI-Project': OPENAI_PROJECT_ID} : {}),
+                                },
+                            });
+                            if (!res.ok) {
+                                const t = await res.text().catch(() => '');
+                                fastify.log.warn({ callId: callIdToEnd, status: res.status, body: t }, 'SIP hangup call failed');
+                            } else {
+                                fastify.log.info({ callId: callIdToEnd }, 'SIP call hung up');
                             }
-                        } catch {
+                        } catch (e) {
+                            fastify.log.warn({ callId: callIdToEnd, err: e?.message || String(e) }, 'SIP hangup call error');
                         }
-                    });
+                    }
 
-                    ws.on('error', (err) => {
-                        fastify.log.info({err, type: 'error'}, 'Realtime SIP session error');
-                    });
+                    function formatE164(digits) {
+                        const d = String(digits || '').replace(/\D/g, '');
+                        if (!d) return '';
+                        return d.startsWith('+') ? d : `+${d}`;
+                    }
 
-                    ws.on('close', (code, reason) => {
-                        fastify.log.info({callId: id, code, reason: String(reason || '')}, 'SIP events WS closed');
-                    });
+                    function buildCheckoutLink(uid) {
+                        const product = process.env.GUMROAD_PRODUCT_PERMALINK;
+                        if (!product) return '';
+                        return `https://yitzi.gumroad.com/l/${product}?wanted=true&userId=${encodeURIComponent(uid)}`;
+                    }
+
+                    // Choose a suitable FROM for SMS based on destination country (fallbacks preserved)
+                    function pickTwilioFromFor(toE164) {
+                        const MSG_SID = process.env.TWILIO_MESSAGING_SERVICE_SID;
+                        if (MSG_SID) return { messagingServiceSid: MSG_SID };
+
+                        const mapStr = process.env.TWILIO_GEO_FROM_MAP || '';
+                        let geoMap = {};
+                        try { if (mapStr) geoMap = JSON.parse(mapStr); } catch {}
+
+                        // Exact prefix match from map keys (e.g., { "+972": "+972533623944", "+1": "+15185551234" })
+                        const prefixes = Object.keys(geoMap || {}).filter(k => typeof geoMap[k] === 'string');
+                        prefixes.sort((a,b) => b.length - a.length); // longest prefix first
+                        for (const p of prefixes) {
+                            if (toE164.startsWith(p)) {
+                                return { from: formatE164(geoMap[p]) };
+                            }
+                        }
+
+                        // Simple Israeli override if provided
+                        if (toE164.startsWith('+972')) {
+                            const IL = process.env.TWILIO_FROM_IL || process.env.TWILIO_FROM_972;
+                            if (IL) return { from: formatE164(IL) };
+                        }
+
+                        // Generic fallbacks
+                        const FROM = process.env.TWILIO_FROM || process.env.TWILIO_NUMBER || process.env.TWILIO_FROM_DEFAULT;
+                        if (FROM) return { from: formatE164(FROM) };
+
+                        return {}; // none found
+                    }
+
+                    async function sendTopupSms(uid) {
+                        try {
+                            const SID = process.env.TWILIO_ACCOUNT_SID;
+                            const AUTH = process.env.TWILIO_AUTH_TOKEN;
+                            const MSG_SID = process.env.TWILIO_MESSAGING_SERVICE_SID;
+                            if (!SID || !AUTH) {
+                                fastify.log.info({ uid }, 'SMS disabled (missing TWILIO envs)');
+                                return;
+                            }
+                            const to = formatE164(uid);
+                            const fromChoice = pickTwilioFromFor(to);
+                            const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(SID)}/Messages.json`;
+                            const link = buildCheckoutLink(uid);
+                            const body = `You're out of minutes. Add more here: ${link || 'https://gumroad.com/'}`;
+                            const authHeader = 'Basic ' + Buffer.from(`${SID}:${AUTH}`).toString('base64');
+                            const resp = await fetch(url, {
+                                method: 'POST',
+                                headers: {
+                                    'Authorization': authHeader,
+                                    'Content-Type': 'application/x-www-form-urlencoded',
+                                },
+                                body: new URLSearchParams({
+                                    To: to,
+                                    Body: body,
+                                    ...(fromChoice.messagingServiceSid ? { MessagingServiceSid: fromChoice.messagingServiceSid } : {}),
+                                    ...(fromChoice.from ? { From: fromChoice.from } : {}),
+                                }),
+                            });
+                            if (!resp.ok) {
+                                const t = await resp.text().catch(() => '');
+                                fastify.log.warn({ status: resp.status, body: t, to, fromChoice }, 'Failed to send SMS');
+                            } else {
+                                fastify.log.info({ to, fromChoice }, 'Sent top-up SMS');
+                            }
+                        } catch (e) {
+                            fastify.log.warn({ err: e?.message || String(e) }, 'SMS error');
+                        }
+                    }
+
+                    async function stopSession(reason) {
+                        if (ended) return;
+                        ended = true;
+                        try {
+                            if (reason === 'out-of-minutes') {
+                                // Wait for OUR final response to finish, then hang up.
+                                // We arm on our next turn_started, capture its response.id, and hang up on matching turn_done.
+                                const MAX_WAIT_MS = Number(process.env.HANGUP_MAX_WAIT_MS || '10000');
+                                let armed = true;
+                                let targetResponseId = null;
+                                let fallbackTimer = null;
+                                const cleanup = () => {
+                                    try { session.transport.off('turn_started', onTurnStarted); } catch {}
+                                    try { session.transport.off('turn_done', onTurnDone); } catch {}
+                                    if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
+                                };
+                                const endNow = () => {
+                                    cleanup();
+                                    const POST_DELAY = Number(process.env.HANGUP_POST_TURN_DELAY_MS || '2500');
+                                    setTimeout(() => {
+                                        hangupSipCall(id);
+                                        try { session.close(); } catch {}
+                                    }, Math.max(0, POST_DELAY));
+                                };
+                                const onTurnStarted = (ev) => {
+                                    if (!armed || targetResponseId) return;
+                                    const rid = ev?.providerData?.response?.id || ev?.response?.id || null;
+                                    if (rid) {
+                                        targetResponseId = rid;
+                                        armed = false;
+                                    }
+                                };
+                                const onTurnDone = (ev) => {
+                                    const rid = ev?.response?.id || null;
+                                    if (!targetResponseId) return; // haven't captured our response yet
+                                    if (rid && rid === targetResponseId) {
+                                        endNow();
+                                    }
+                                };
+                                try { session.transport.on('turn_started', onTurnStarted); } catch {}
+                                try { session.transport.on('turn_done', onTurnDone); } catch {}
+                                fallbackTimer = setTimeout(() => { endNow(); }, MAX_WAIT_MS);
+
+                                // Ask the agent to inform the caller (after listeners armed)
+                                try {
+                                    session.sendMessage(
+                                        'Please inform the caller in one brief, clear sentence that their minutes have run out and that you will text them a link to add more. Then stop speaking.'
+                                    );
+                                } catch {}
+                                // Send the SMS in parallel; the hangup will only occur once the agent finishes speaking
+                                sendTopupSms(userId).catch(() => {});
+                            }
+                        } catch {}
+                        if (reason !== 'out-of-minutes') {
+                            try { session.close(); } catch {}
+                        }
+                        if (billingTimer) { clearInterval(billingTimer); billingTimer = null; }
+                        fastify.log.info({ callId: id, userId, reason }, 'Session closed');
+                    }
+
+                    try {
+                        // One-time initial trial top-up for first-time callers (if configured)
+                        try { await ensureInitialTrialTopup(userId).catch(() => {}); } catch {}
+
+                        // Check entitlement before connecting
+                        let remaining = await totalSecondsLeft(userId).catch(() => 0);
+                        if (remaining <= 0) {
+                            // Connect to deliver the out-of-minutes announcement and SMS, then hang up gracefully
+                            await session.connect({ apiKey: OPENAI_API_KEY, url: wsUrl });
+                            setTimeout(() => stopSession('out-of-minutes'), 300);
+                            return;
+                        }
+
+                        await session.connect({ apiKey: OPENAI_API_KEY, url: wsUrl });
+
+                        // Start periodic deduction while the call is active
+                        billingTimer = setInterval(async () => {
+                            try {
+                                const ent = await ensureEntitlement(userId);
+                                const total = Math.max(0, (ent.trialLeft || 0) + (ent.paidLeft || 0));
+                                if (total <= 0) {
+                                    await stopSession('out-of-minutes');
+                                    return;
+                                }
+                                const seconds = Math.max(1, Math.min(TICK_SECONDS, Math.floor(total)));
+                                await deductSeconds(userId, seconds, { reason: 'voice_call' });
+                                const after = await ensureEntitlement(userId);
+                                const left = Math.max(0, (after.trialLeft || 0) + (after.paidLeft || 0));
+                                if (left <= 0) await stopSession('out-of-minutes');
+                            } catch (e) {
+                                fastify.log.warn({ callId: id, err: e?.message || String(e) }, 'Billing tick failed');
+                            }
+                        }, TICK_SECONDS * 1000);
+
+                        // Optional: immediate greeting so callers hear something promptly
+                        session.sendMessage('Thank you for calling, how can I help you?');
+                        // Ensure timer cleared on disconnect
+                        session.transport.on('disconnected', () => {
+                            if (billingTimer) { clearInterval(billingTimer); billingTimer = null; }
+                        });
+                    } catch (e) {
+                        fastify.log.error({ callId: id, err: e?.message || e }, 'Failed to connect Agents session');
+                    }
                 };
 
-                // Connect after a short delay
-                setTimeout(() => connectSIPEventsWs(callId), 150);
+                // Connect shortly after accept
+                setTimeout(() => { attachAgentsSession(callId); }, 150);
             } catch (err) {
                 fastify.log.error({err}, 'Failed to accept SIP call');
             }
